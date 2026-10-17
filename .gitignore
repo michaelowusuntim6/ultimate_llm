@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+bin/
+*.o
+
+# Model weights (large mmap'd sketches + extracted assets)
+models/
+*.db
+*.bin
+
+# Logs and reports
+logs/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+
+# Local CLI settings
+.qoder/

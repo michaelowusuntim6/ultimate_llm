@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 /* Count-based n-gram trainer: no SGD, no softmax. We just tally next-token
@@ -22,6 +23,24 @@ static inline uint32_t hash_sig(uint32_t t1, uint32_t t2, uint32_t seed) {
     return h ? h : 1;
 }
 
+#define KN_DISCOUNT 0.75f
+
+/* Interpolated Kneser-Ney probability of class `cls` given a meta slot's
+   topk counts + context total, backed off to a unigram distribution. */
+static float kn_prob(const sketch_slot_t *meta, uint32_t cls, int n_cand_unused) {
+    (void)n_cand_unused;
+    if (!meta || meta->count == 0) return 0.0f;
+    float c = (float)meta->count;
+    for (int k = 0; k < 8; k++) {
+        if (meta->topk_classes[k] == cls && meta->topk_counts[k] > 0) {
+            float d = (float)meta->topk_counts[k];
+            float disc = d - KN_DISCOUNT; if (disc < 0) disc = 0;
+            return disc / c;
+        }
+    }
+    return 0.0f;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = (argc > 1) ? argv[1] : "models";
     int max_lines = (argc > 2) ? atoi(argv[2]) : 175926;
@@ -30,6 +49,10 @@ int main(int argc, char **argv) {
     tokenizer_t tok;
     if (tok_init(&tok, "/home/mike/Vocab/tokenizer_pure/vocab.json",
                       "/home/mike/Vocab/tokenizer_pure/merges.txt") != 0) return 1;
+
+    /* Unigram continuation counts (for KN base distribution). */
+    float *uni = calloc((size_t)tok.n_vocab, sizeof(float));
+    double uni_total = 0.0;
 
     printf("[train] Initializing 4 sketches (8M slots each)...\n");
     sketch_t sk[4];
@@ -62,6 +85,9 @@ int main(int argc, char **argv) {
             uint32_t t3 = (uint32_t)tokens[i-3], t4 = (uint32_t)tokens[i-4];
             uint32_t t5 = (uint32_t)tokens[i-5];
             uint32_t true_c = (uint32_t)tokens[i];
+
+            /* unigram continuation tally */
+            if (true_c < (uint32_t)tok.n_vocab) { uni[true_c] += 1.0f; uni_total += 1.0; }
 
             uint32_t sig[4];
             sig[0] = hash_sig(t1, t2, seeds[0]);
@@ -106,6 +132,57 @@ int main(int argc, char **argv) {
     }
 
     printf("GATE PASS: Counting complete. Processed %d lines.\n", lines_read);
+
+    /* ---- Held-out interpolation weight tuning (EM-style coordinate search) ---- */
+    printf("[train] Tuning KN interpolation weights on held-out 10%%...\n");
+    float lam[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+    double uni_norm = uni_total > 0 ? uni_total : 1.0;
+
+    /* score function: mean log-prob over held-out tokens given weights */
+    #define EVAL_N 20000
+    shard_reader_t tr;
+    if (shard_open(&tr, "/home/mike/Vocab/dataset_prose.txt", 64) != 0) return 1;
+    char *tl; size_t tlen; int tline = 0;
+    int32_t ttokbuf[4096];
+    /* precompute per-token order probs for held-out sample */
+    static float hp[EVAL_N][5]; static uint32_t htrue[EVAL_N]; int hn = 0;
+    while (shard_next_line(&tr, &tl, &tlen) > 0 && hn < EVAL_N) {
+        tline++;
+        if (tline % 10 != 0) continue; /* every 10th line ~ held-out */
+        int nt = tok_encode(&tok, tl, (int32_t)tlen, ttokbuf, 4096);
+        for (int i = 5; i < nt && hn < EVAL_N; i++) {
+            uint32_t t1=(uint32_t)ttokbuf[i-1],t2=(uint32_t)ttokbuf[i-2];
+            uint32_t t3=(uint32_t)ttokbuf[i-3],t4=(uint32_t)ttokbuf[i-4],t5=(uint32_t)ttokbuf[i-5];
+            uint32_t tc=(uint32_t)ttokbuf[i];
+            uint32_t sg[4]={hash_sig(t1,t2,seeds[0]),hash_sig(t2,t3,seeds[1]),hash_sig(t1,t4,seeds[2]),hash_sig(t3,t5,seeds[3])};
+            float p_uni = uni[tc]/uni_norm; if(p_uni<=0) p_uni=1e-6f;
+            hp[hn][4]=p_uni;
+            for (int v=0;v<4;v++){ sketch_slot_t*m=sk_get(&sk[v],sg[v]); hp[hn][v]=kn_prob(m,tc,0); }
+            htrue[hn]=tc; hn++;
+        }
+    }
+    shard_close(&tr);
+
+    double total_ll = 0; for(int i=0;i<hn;i++){ double pr=0; for(int v=0;v<4;v++)pr+=lam[v]*hp[i][v]; pr+= (1-lam[0]-lam[1]-lam[2]-lam[3])*hp[i][4]; if(pr<1e-12)pr=1e-12; total_ll+=log(pr);} 
+    for (int sweep=0; sweep<3; sweep++) {
+        for (int v=0; v<4; v++) {
+            float best=lam[v]; double bestll=total_ll;
+            for (float cand=0.0f; cand<=1.0001f; cand+=0.05f) {
+                float old=lam[v]; lam[v]=cand;
+                double s=0; for(int i=0;i<hn;i++){ double pr=0; for(int q=0;q<4;q++)pr+=lam[q]*hp[i][q]; float rem=1-lam[0]-lam[1]-lam[2]-lam[3]; if(rem<0)rem=0; pr+=rem*hp[i][4]; if(pr<1e-12)pr=1e-12; s+=log(pr);}
+                if (s>bestll){bestll=s;best=cand;}
+                lam[v]=old;
+            }
+            lam[v]=best; total_ll=bestll;
+        }
+        /* renormalize so sum<=1 */
+        float sm=lam[0]+lam[1]+lam[2]+lam[3]; if(sm>1){for(int v=0;v<4;v++)lam[v]/=sm;}
+    }
+    FILE *wf=fopen("models/kneser_ney_weights.bin","wb"); if(wf){fwrite(lam,sizeof(float),4,wf);fclose(wf);}
+    printf("[train] learned lambda: %.3f %.3f %.3f %.3f (heldout LL/token=%.4f)\n",
+           lam[0],lam[1],lam[2],lam[3], hn?total_ll/hn:0);
+
+    free(uni);
     for (int v = 0; v < 4; v++) sk_free(&sk[v]);
     shard_close(&sr);
     tok_free(&tok);

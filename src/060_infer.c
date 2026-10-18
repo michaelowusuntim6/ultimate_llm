@@ -7,6 +7,7 @@
 #include <math.h>
 
 #define UNION_CAP 96
+#define KN_DISCOUNT 0.75f
 
 static inline uint32_t hash_sig(uint32_t t1, uint32_t t2, uint32_t seed) {
     uint32_t h = seed; h ^= t1; h *= 0x01000193u; h ^= t2; h *= 0x01000193u;
@@ -17,6 +18,29 @@ static uint32_t rng_state = 12345;
 static inline uint32_t fast_rand(void) {
     rng_state ^= rng_state << 13; rng_state ^= rng_state >> 17; rng_state ^= rng_state << 5;
     return rng_state;
+}
+
+/* discounted prob of cls from a meta slot (0 if unseen) */
+static float kn_order(const sketch_slot_t *meta, uint32_t cls) {
+    if (!meta || meta->count == 0) return 0.0f;
+    float c = (float)meta->count;
+    for (int k = 0; k < 8; k++)
+        if (meta->topk_classes[k] == cls && meta->topk_counts[k] > 0) {
+            float d = (float)meta->topk_counts[k];
+            float disc = d - KN_DISCOUNT; if (disc < 0) disc = 0;
+            return disc / c;
+        }
+    return 0.0f;
+}
+
+/* interpolated score for candidate `cls` given per-order metas + unigram prob */
+static float kn_score(const sketch_slot_t *m[4], const float lam[4],
+                      uint32_t cls, float p_uni) {
+    double pr = (1.0 - lam[0] - lam[1] - lam[2] - lam[3]);
+    if (pr < 0) pr = 0;
+    pr *= p_uni;
+    for (int v = 0; v < 4; v++) pr += lam[v] * kn_order(m[v], cls);
+    return (float)pr;
 }
 
 int main(int argc, char **argv) {
@@ -31,9 +55,22 @@ int main(int argc, char **argv) {
         if (sk_init(&sk[v], path, 8388608) != 0) return 1;
     }
 
+    /* learned interpolation weights */
+    float lam[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+    FILE *wf = fopen("models/kneser_ney_weights.bin", "rb");
+    if (wf) { if (fread(lam, sizeof(float), 4, wf) != 4) fprintf(stderr,"[infer] weights short read\n"); fclose(wf); }
+
+    /* unigram distribution */
+    float *uni = calloc((size_t)tok.n_vocab, sizeof(float));
+    double uni_total = 0;
+    uint32_t top_u[1000]; int n_top = 0;
+    FILE *uf = fopen("models/top_unigrams.bin", "rb");
+    if (uf) { n_top = (int)fread(top_u, sizeof(uint32_t), 1000, uf); fclose(uf); }
+    /* approximate uniform over top unigrams as fallback base */
+    for (int i = 0; i < n_top; i++) { if (top_u[i] < (uint32_t)tok.n_vocab) { uni[top_u[i]] = 1.0f; uni_total += 1.0; } }
+    if (uni_total == 0) { uni_total = 1; }
+
     uint32_t seeds[4] = {0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35, 0x27D4EB2F};
-    /* Stupid-backoff weights per view: higher-order views get more trust. */
-    float backoff_w[4] = {0.4f, 0.25f, 0.2f, 0.15f};
     float temp = 1.0f;
 
     const char *prompt = (argc > 1) ? argv[1] : "The";
@@ -47,7 +84,6 @@ int main(int argc, char **argv) {
 
     char out_buf[16384];
     int out_len = 0;
-    /* echo the prompt first */
     { int dl = tok_decode(&tok, tokens, n_tok, out_buf, sizeof(out_buf)-1); if (dl>0) out_len = dl; }
 
     for (int step = 0; step < max_gen; step++) {
@@ -60,41 +96,64 @@ int main(int argc, char **argv) {
         sig[0]=hash_sig(t1,t2,seeds[0]); sig[1]=hash_sig(t2,t3,seeds[1]);
         sig[2]=hash_sig(t1,t4,seeds[2]); sig[3]=hash_sig(t3,t5,seeds[3]);
 
-        /* gather candidates from all Top-K lists across views */
+        const sketch_slot_t *m[4];
+        for (int v = 0; v < 4; v++) m[v] = sk_get(&sk[v], sig[v]);
+
+        /* gather candidate union from all orders' topk lists */
         uint32_t cand[UNION_CAP]; int n_cand = 0;
-        float score[UNION_CAP];
         for (int v = 0; v < 4; v++) {
-            sketch_slot_t *meta = sk_get(&sk[v], sig[v]);
-            if (!meta || meta->count == 0) continue;
+            if (!m[v] || m[v]->count == 0) continue;
             for (int k = 0; k < 8; k++) {
-                uint32_t cl = meta->topk_classes[k];
-                if (cl == 0 || meta->topk_counts[k] == 0) continue;
-                int found = -1;
-                for (int j = 0; j < n_cand; j++) if (cand[j] == cl) { found = j; break; }
-                float p = (float)meta->topk_counts[k] / (float)meta->count;
-                if (found >= 0) score[found] += p * backoff_w[v];
-                else if (n_cand < UNION_CAP) { cand[n_cand] = cl; score[n_cand] = p * backoff_w[v]; n_cand++; }
+                uint32_t cl = m[v]->topk_classes[k];
+                if (cl == 0 || m[v]->topk_counts[k] == 0) continue;
+                int found = 0; for (int j = 0; j < n_cand; j++) if (cand[j]==cl){found=1;break;}
+                if (!found && n_cand < UNION_CAP) cand[n_cand++] = cl;
             }
         }
-        if (n_cand == 0) break; /* no continuation known */
+        /* add a few unigram candidates so backoff has coverage */
+        for (int j = 0; j < n_top && n_cand < UNION_CAP; j += 7) {
+            uint32_t cl = top_u[j]; int found=0; for(int q=0;q<n_cand;q++)if(cand[q]==cl){found=1;break;}
+            if(!found) cand[n_cand++]=cl;
+        }
+        if (n_cand == 0) break;
 
-        /* softmax over scores with temperature, then sample */
-        float mx = -1e30f;
-        for (int c = 0; c < n_cand; c++) if (score[c]/temp > mx) mx = score[c]/temp;
-        float sum = 0; float p[UNION_CAP];
-        for (int c = 0; c < n_cand; c++) { p[c] = expf(score[c]/temp - mx); sum += p[c]; }
+        /* score each candidate with interpolated KN */
+        float score[UNION_CAP], mx = -1e30f;
+        for (int c = 0; c < n_cand; c++) {
+            float pu = (cand[c] < (uint32_t)tok.n_vocab && uni[cand[c]]>0) ? uni[cand[c]]/(float)uni_total : 1e-6f;
+            score[c] = kn_score(m, lam, cand[c], pu);
+            if (score[c] > mx) mx = score[c];
+        }
+
+        /* softmax with temperature then sample */
+        float p[UNION_CAP], sum = 0;
+        for (int c = 0; c < n_cand; c++) { p[c] = expf((score[c] - mx)/temp); sum += p[c]; }
         float r = (float)(fast_rand() % 100000) / 100000.0f * sum;
         float cum = 0; uint32_t next = cand[0];
         for (int c = 0; c < n_cand; c++) { cum += p[c]; if (r <= cum) { next = cand[c]; break; } }
 
         tokens[n_tok++] = (int32_t)next;
-        int dl = tok_decode(&tok, (const int32_t[]){(int32_t)next}, 1, out_buf + out_len, (int32_t)sizeof(out_buf) - out_len - 1);
-        if (dl > 0) out_len += dl;
+
+        /* deterministic spacing post-processing */
+        int32_t nt = (int32_t)next;
+        char piece[64]; int pl = tok_decode(&tok, &nt, 1, piece, sizeof(piece)-1);
+        if (pl > 0) {
+            piece[pl] = '\0';
+            int starts_space = (piece[0]==' '||piece[0]=='\t');
+            int starts_punct = (piece[0]=='.'||piece[0]==','||piece[0]=='!'||piece[0]=='?'||piece[0]==';'||piece[0]==':');
+            int prev_space = (out_len>0 && (out_buf[out_len-1]==' '||out_buf[out_len-1]=='\t'||out_buf[out_len-1]=='\n'));
+            int prev_punct = (out_len>0 && (out_buf[out_len-1]=='.'||out_buf[out_len-1]==','||out_buf[out_len-1]=='!'||out_buf[out_len-1]=='?'));
+            if (!starts_space && !starts_punct && out_len>0 && !prev_space && !prev_punct) {
+                if (out_len+1 < (int)sizeof(out_buf)) out_buf[out_len++]=' ';
+            }
+            if (out_len + pl < (int)sizeof(out_buf)) { memcpy(out_buf+out_len, piece, pl); out_len += pl; }
+        }
     }
 
     out_buf[out_len] = '\0';
     printf("\n--- OUTPUT ---\n%s\n--------------\n", out_buf);
 
+    free(uni);
     for (int v = 0; v < 4; v++) sk_free(&sk[v]);
     tok_free(&tok);
     return 0;

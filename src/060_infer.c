@@ -147,9 +147,11 @@ int main(int argc, char **argv) {
         /* 6. Append and decode */
         tokens[n_tok++] = (int32_t)next_tok;
 
-        /* Inject space before word tokens for coherent output */
+        /* Inject space before word tokens, but avoid double spaces */
         if (next_tok < (uint32_t)tok.n_word_tokens && out_len > 0) {
-            out_buf[out_len++] = ' ';
+            if (out_buf[out_len-1] != ' ') {
+                out_buf[out_len++] = ' ';
+            }
         }
 
         int32_t nt32 = (int32_t)next_tok;

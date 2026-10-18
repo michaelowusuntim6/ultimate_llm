@@ -113,14 +113,17 @@ int main(int argc, char **argv) {
             int n_cand = 0;
             cand[n_cand++] = true_c; /* Always include true class */
 
-            /* 2a. Context predictions: top-1 per view, deduped */
+            /* 2a. Context predictions: ALL Top-8 per view, deduped */
             for (int v = 0; v < 4; v++) {
                 sketch_slot_t *meta = sk_get(&sk[v], sig[v]);
                 if (meta && meta->count > 0) {
-                    int found = 0;
-                    for (int j = 0; j < n_cand; j++)
-                        if (cand[j] == meta->class_id) { found = 1; break; }
-                    if (!found) cand[n_cand++] = meta->class_id;
+                    for (int k = 0; k < 8; k++) {
+                        if (meta->topk_classes[k] == 0) continue; /* empty slot */
+                        int found = 0;
+                        for (int j = 0; j < n_cand; j++)
+                            if (cand[j] == meta->topk_classes[k]) { found = 1; break; }
+                        if (!found) cand[n_cand++] = meta->topk_classes[k];
+                    }
                 }
             }
 

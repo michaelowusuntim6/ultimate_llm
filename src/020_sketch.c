@@ -91,22 +91,24 @@ sketch_slot_t* sk_upsert(sketch_t *sk, uint32_t key) {
 }
 
 void sk_evict_sweep(sketch_t *sk, uint16_t count_threshold, uint16_t gen_window) {
+    (void)gen_window; /* Unused now */
     size_t evicted = 0;
-    uint16_t cutoff_gen = sk->current_gen > gen_window ? sk->current_gen - gen_window : 0;
-    
-    /* Naive full sweep. For 32M slots, this touches 512MB, taking ~0.2s on Ivy Bridge.
-       Acceptable since it triggers rarely (when load factor > 0.90). */
-    for (size_t i = 0; i < sk->capacity; i++) {
+    size_t target_evictions = sk->capacity * 0.10; /* Aim to clear 10% */
+
+    for (size_t i = 0; i < sk->capacity && evicted < target_evictions; i++) {
         sketch_slot_t *s = &sk->slots[i];
-        if (s->key != 0 && s->count <= count_threshold && s->gen < cutoff_gen) {
-            s->key = 0;
-            s->logit = 0.0f;
-            s->count = 0;
-            s->gen = 0;
-            evicted++;
-            sk->n_entries--;
+        /* Randomly evict low-count entries to break up probe chains */
+        if (s->key != 0 && s->count <= count_threshold) {
+            if ((rand() % 100) < 20) { /* Evict 20% of low-count entries we see */
+                s->key = 0;
+                s->logit = 0.0f;
+                s->count = 0;
+                s->gen = 0;
+                memset(s->topk_classes, 0, sizeof(s->topk_classes));
+                evicted++;
+                sk->n_entries--;
+            }
         }
     }
-    sk->current_gen++;
-    fprintf(stderr, "[sketch] sweep: evicted %zu, live %zu, gen -> %u\n", evicted, sk->n_entries, sk->current_gen);
+    fprintf(stderr, "[sketch] sweep: evicted %zu, live %zu\n", evicted, sk->n_entries);
 }

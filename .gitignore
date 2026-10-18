@@ -17,3 +17,6 @@ logs/
 
 # Local CLI settings
 .qoder/
+
+# Large training corpora (not committed)
+dataset/

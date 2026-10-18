@@ -108,7 +108,7 @@ static void generate(tokenizer_t *tok, sketch_t sk[3], const float lam[3],
 
 int main(void) {
     tokenizer_t tok;
-    if (tok_init(&tok, "/home/mike/Vocab/vocab_english.txt",
+    if (tok_init(&tok, "models/vocab_expanded.txt",
                       "/home/mike/Vocab/byte_fallback_tokens.txt") != 0) return 1;
     sketch_t sk[3]; char path[256];
     for (int v = 0; v < 3; v++) { snprintf(path,sizeof(path),"models/view_%d.db",v); if(sk_init(&sk[v],path,8388608)!=0) return 1; }

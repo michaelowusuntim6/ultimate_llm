@@ -54,7 +54,7 @@ static double kn_rec(const sketch_slot_t *m[3], const float lam[3],
 
 int main(int argc, char **argv) {
     tokenizer_t tok;
-    if (tok_init(&tok, "/home/mike/Vocab/vocab_english.txt",
+    if (tok_init(&tok, "models/vocab_expanded.txt",
                       "/home/mike/Vocab/byte_fallback_tokens.txt") != 0) return 1;
 
     sketch_t sk[3];

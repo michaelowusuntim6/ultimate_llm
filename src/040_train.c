@@ -7,6 +7,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <limits.h>
 
 /* Count-based n-gram trainer: no SGD, no softmax. We just tally next-token
    frequencies per context signature into the Top-K slot lists. */
@@ -51,11 +52,12 @@ static double kn_eval(const float (*hprow)[4], const float lam[3], int i) {
 
 int main(int argc, char **argv) {
     const char *model_dir = (argc > 1) ? argv[1] : "models";
-    int max_lines = (argc > 2) ? atoi(argv[2]) : 175926;
+    int max_lines = (argc > 2) ? atoi(argv[2]) : 0;   /* 0 = process entire file */
+    if (max_lines <= 0) max_lines = INT_MAX;
 
-    printf("[train] Loading 231k word tokenizer...\n");
+    printf("[train] Loading expanded word tokenizer...\n");
     tokenizer_t tok;
-    if (tok_init(&tok, "/home/mike/Vocab/vocab_english.txt",
+    if (tok_init(&tok, "models/vocab_expanded.txt",
                       "/home/mike/Vocab/byte_fallback_tokens.txt") != 0) return 1;
 
     /* Unigram continuation counts (for KN base distribution). */
@@ -74,7 +76,7 @@ int main(int argc, char **argv) {
 
     printf("[train] Opening corpus stream...\n");
     shard_reader_t sr;
-    if (shard_open(&sr, "/home/mike/Vocab/dataset_prose.txt", 64) != 0) return 1;
+    if (shard_open(&sr, "dataset/ts-ds/tinystories_train.txt", 64) != 0) return 1;
 
     char *line; size_t len;
     int32_t tokens[4096];
@@ -107,6 +109,7 @@ int main(int argc, char **argv) {
 
             for (int v = 0; v < 3; v++) {
                 sketch_slot_t *meta = sk_upsert(&sk[v], sig[v]);
+                if (!meta) continue;   /* table full; skip this order */
                 /* find true_c in topk list */
                 int found = -1;
                 for (int k = 0; k < 8; k++) if (meta->topk_classes[k] == true_c) { found = k; break; }
@@ -138,8 +141,11 @@ int main(int argc, char **argv) {
                    sk[0].n_entries, sk[1].n_entries, sk[2].n_entries);
             fflush(stdout);
             for (int v = 0; v < 3; v++)
-                if (sk[v].n_entries > sk[v].capacity * 0.85)
+                while (sk[v].n_entries > sk[v].capacity * 0.75) {
+                    size_t before = sk[v].n_entries;
                     sk_evict_sweep(&sk[v], 2, 1);
+                    if (sk[v].n_entries >= before) break; /* no progress: stop */
+                }
         }
     }
 
@@ -152,7 +158,7 @@ int main(int argc, char **argv) {
 
     #define EVAL_N 20000
     shard_reader_t tr;
-    if (shard_open(&tr, "/home/mike/Vocab/dataset_prose.txt", 64) != 0) return 1;
+    if (shard_open(&tr, "dataset/ts-ds/tinystories_train.txt", 64) != 0) return 1;
     char *tl; size_t tlen; int tline = 0;
     int32_t ttokbuf[4096];
     static float hp[EVAL_N][4]; static uint32_t htrue[EVAL_N]; int hn = 0;

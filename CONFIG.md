@@ -11,6 +11,10 @@ data_dir: /home/mike/Vocab
 vocab_file: /home/mike/Vocab/vocab_english.txt
 fallback_file: /home/mike/Vocab/byte_fallback_tokens.txt
 
+# Phase 8: TinyStories training corpus + expanded vocabulary.
+train_corpus: dataset/ts-ds/tinystories_train.txt
+expanded_vocab: models/vocab_expanded.txt
+
 # Writable roots created by 001_init_dirs.sh.
 build_dir:   build
 model_dir:   models

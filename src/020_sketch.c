@@ -91,22 +91,18 @@ sketch_slot_t* sk_upsert(sketch_t *sk, uint32_t key) {
 }
 
 void sk_evict_sweep(sketch_t *sk, uint16_t count_threshold, uint16_t gen_window) {
-    (void)count_threshold; (void)gen_window;
-    /* Space-Saving: sample random slots and evict the lowest-count entry.
-       Keeps heavy hitters, discards noise, breaks up probe chains. */
-    size_t target = sk->capacity / 10; /* clear ~10% per sweep */
+    (void)gen_window;
+    /* Space-Saving-ish: full linear pass evicting low-count noise entries
+       (count <= threshold) to keep probe chains short and avoid table-full. */
     size_t evicted = 0;
-    unsigned int seed = 12345u + (unsigned)sk->n_entries;
-    for (size_t i = 0; i < target && evicted < target/4; i++) {
-        seed = seed * 1103515245u + 12345u;
-        size_t idx = (seed >> 16) & sk->mask;
-        sketch_slot_t *s = &sk->slots[idx];
-        if (s->key != 0 && s->count <= 2) {
+    for (size_t i = 0; i < sk->capacity; i++) {
+        sketch_slot_t *s = &sk->slots[i];
+        if (s->key != 0 && s->count <= count_threshold) {
             s->key = 0; s->class_id = 0; s->logit = 0.0f; s->count = 0; s->gen = 0;
             memset(s->topk_classes, 0, sizeof(s->topk_classes));
             memset(s->topk_counts, 0, sizeof(s->topk_counts));
             evicted++; sk->n_entries--;
         }
     }
-    fprintf(stderr, "[sketch] space-saving sweep: evicted %zu, live %zu\n", evicted, sk->n_entries);
+    fprintf(stderr, "[sketch] sweep: evicted %zu, live %zu\n", evicted, sk->n_entries);
 }

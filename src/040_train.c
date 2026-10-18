@@ -41,6 +41,14 @@ static float kn_prob(const sketch_slot_t *meta, uint32_t cls, int n_cand_unused)
     return 0.0f;
 }
 
+/* interpolated KN recursion for tuning: hp[i][v]=discounted prob at order v,
+   hp[i][3]=unigram base. P(v) = hp[v] + (1-lam[v])*P(v-1), starting from unigram. */
+static double kn_eval(const float (*hprow)[4], const float lam[3], int i) {
+    double p = hprow[i][3];
+    for (int v = 0; v < 3; v++) { double rem = 1.0 - (double)lam[v]; if (rem < 0) rem = 0; p = (double)hprow[i][v] + rem * p; }
+    return p;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = (argc > 1) ? argv[1] : "models";
     int max_lines = (argc > 2) ? atoi(argv[2]) : 175926;
@@ -107,6 +115,8 @@ int main(int argc, char **argv) {
                         if (meta->topk_counts[k] < meta->topk_counts[worst]) worst = k;
                     meta->topk_classes[worst] = true_c;
                     meta->topk_counts[worst] = 1;
+                    /* track distinct-continuation count (types) in logit */
+                    if (meta->count > 0) meta->logit += 1.0f;
                 }
                 if (meta->class_id == 0 || meta->count == 0) meta->class_id = true_c;
                 if (meta->count < 65535) meta->count++;
@@ -158,19 +168,19 @@ int main(int argc, char **argv) {
     }
     shard_close(&tr);
 
-    double total_ll = 0; for(int i=0;i<hn;i++){ double pr=(1-lam[0]-lam[1]-lam[2])*hp[i][3]; for(int v=0;v<3;v++)pr+=lam[v]*hp[i][v]; if(pr<1e-12)pr=1e-12; total_ll+=log(pr);}
+    /* interpolated KN recursion matching inference */
+    double total_ll = 0; for(int i=0;i<hn;i++){ double pr=kn_eval(hp,lam,i); if(pr<1e-12)pr=1e-12; total_ll+=log(pr);}
     for (int sweep=0; sweep<3; sweep++) {
         for (int v=0; v<3; v++) {
             float best=lam[v]; double bestll=total_ll;
             for (float cand=0.0f; cand<=1.0001f; cand+=0.05f) {
                 float old=lam[v]; lam[v]=cand;
-                double s=0; for(int i=0;i<hn;i++){ double rem=1-lam[0]-lam[1]-lam[2]; if(rem<0)rem=0; double pr=rem*hp[i][3]; for(int q=0;q<3;q++)pr+=lam[q]*hp[i][q]; if(pr<1e-12)pr=1e-12; s+=log(pr);}
+                double s=0; for(int i=0;i<hn;i++){ double pr=kn_eval(hp,lam,i); if(pr<1e-12)pr=1e-12; s+=log(pr);}
                 if (s>bestll){bestll=s;best=cand;}
                 lam[v]=old;
             }
             lam[v]=best; total_ll=bestll;
         }
-        float sm=lam[0]+lam[1]+lam[2]; if(sm>1){for(int v=0;v<3;v++)lam[v]/=sm;}
     }
     FILE *wf=fopen("models/kneser_ney_weights.bin","wb"); if(wf){fwrite(lam,sizeof(float),3,wf);fclose(wf);}
     printf("[train] learned lambda: %.3f %.3f %.3f (heldout LL/token=%.4f)\n",

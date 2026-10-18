@@ -33,6 +33,25 @@ static float kn_order(const sketch_slot_t *meta, uint32_t cls) {
     return 0.0f;
 }
 
+/* True interpolated Kneser-Ney with context-dependent backoff weight.
+   meta->logit stores #distinct continuations (types); count stores tokens.
+   gamma(h) = D * types(h) / count(h); P_KN(w|h) = disc/count + gamma * P_lower.
+   A NULL context yields disc=0 and gamma=1 -> full weight to lower order. */
+static double kn_rec(const sketch_slot_t *m[3], const float lam[3],
+                     uint32_t w, int v, double p_uni) {
+    if (v < 0) return p_uni;                       /* unigram base */
+    const sketch_slot_t *meta = m[v];
+    double p_high = kn_order(meta, w);             /* discounted term, 0 if unseen */
+    double gamma = 1.0;                            /* default: pass all weight down */
+    if (meta && meta->count > 0) {
+        double types = meta->logit > 0 ? meta->logit : 1.0;
+        gamma = (double)KN_DISCOUNT * types / (double)meta->count;
+        if (gamma > 1.0) gamma = 1.0;
+    }
+    double mix = lam[v] >= 0 ? (double)lam[v] : 1.0; /* learned scale, fallback 1 */
+    return p_high + gamma * mix * kn_rec(m, lam, w, v - 1, p_uni);
+}
+
 int main(int argc, char **argv) {
     tokenizer_t tok;
     if (tok_init(&tok, "/home/mike/Vocab/tokenizer_pure/vocab.json",
@@ -45,9 +64,9 @@ int main(int argc, char **argv) {
         if (sk_init(&sk[v], path, 8388608) != 0) return 1;
     }
 
-    float lam[3] = {0.33f, 0.33f, 0.33f};
+    float lam[3] = {1.0f, 1.0f, 1.0f};
     FILE *wf = fopen("models/kneser_ney_weights.bin", "rb");
-    if (wf) { if (fread(lam, sizeof(float), 3, wf) != 3) fprintf(stderr,"[infer] weights short read\n"); fclose(wf); }
+    if (wf) { float tmp[3]; if (fread(tmp, sizeof(float), 3, wf) == 3) { for(int v=0;v<3;v++) lam[v] = tmp[v] > 0 ? tmp[v] : 1.0f; } fclose(wf); }
 
     /* unigram distribution over top 100 */
     uint32_t top_u[100]; int n_top = 0;
@@ -59,7 +78,7 @@ int main(int argc, char **argv) {
     if (utot <= 0) utot = 1;
 
     uint32_t seeds[3] = {0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35};
-    float temp = 1.0f;
+    float temp = 0.4f;   /* sharpen distribution so high-prob continuations win */
 
     const char *prompt = (argc > 1) ? argv[1] : "The";
     int max_gen = (argc > 2) ? atoi(argv[2]) : 50;
@@ -87,44 +106,52 @@ int main(int argc, char **argv) {
         const sketch_slot_t *m[3];
         for (int v = 0; v < 3; v++) m[v] = sk_get(&sk[v], sig[v]);
 
-        /* candidate set: ALWAYS seed with all unigrams first */
+        /* candidate set: seed with unigrams, skipping specials/unk */
         uint32_t cand[UNION_CAP]; int n_cand = 0;
         for (int j = 0; j < n_top && n_cand < UNION_CAP; j++) {
-            uint32_t cl = top_u[j]; if (cl==0) continue;
+            uint32_t cl = top_u[j]; if (cl < 5) continue; /* skip <pad><unk><bos><eos><mask> */
             int found=0; for(int q=0;q<n_cand;q++)if(cand[q]==cl){found=1;break;}
             if(!found) cand[n_cand++]=cl;
         }
-        /* then add sketch Top-K candidates */
+        /* then add sketch Top-K candidates (skip specials) */
         for (int v = 0; v < 3; v++) {
             if (!m[v] || m[v]->count == 0) continue;
             for (int k = 0; k < 8 && n_cand < UNION_CAP; k++) {
                 uint32_t cl = m[v]->topk_classes[k];
-                if (cl == 0 || m[v]->topk_counts[k] == 0) continue;
+                if (cl < 5 || m[v]->topk_counts[k] == 0) continue;
                 int found=0; for(int q=0;q<n_cand;q++)if(cand[q]==cl){found=1;break;}
                 if(!found) cand[n_cand++]=cl;
             }
         }
         if (n_cand == 0) break;
 
-        /* interpolated KN score over the FULL candidate set */
+        /* true interpolated KN recursion over the FULL candidate set */
         float score[UNION_CAP], mx = -1e30f;
         for (int c = 0; c < n_cand; c++) {
             uint32_t w = cand[c];
-            /* unigram base probability (rank-weighted over top list) */
-            float p_uni = 1e-6f;
-            for (int j = 0; j < n_top; j++) if (top_u[j]==w) { p_uni = (float)uni_p[j]/(float)utot; break; }
-            /* recursion: P3 = lam2*p_uni + ... build from low order up */
-            double pr = (1.0 - lam[0]-lam[1]-lam[2]); if(pr<0)pr=0; pr *= p_uni;
-            for (int v = 0; v < 3; v++) pr += lam[v] * (double)kn_order(m[v], w);
-            score[c] = (float)pr;
+            double p_uni = 1e-9;
+            for (int j = 0; j < n_top; j++) if (top_u[j]==w) { p_uni = (double)uni_p[j]/utot; break; }
+            double s = kn_rec(m, lam, w, 2, p_uni);
+            /* prefer real words over single-letter subword fragments */
+            int32_t wid = (int32_t)w;
+            int is_word = (wid >= 0 && wid < tok.n_vocab && tok.text_len[wid] > 2);
+            if (!is_word) s *= 0.5;   /* damp short/fragment pieces to reduce salad */
+            score[c] = (float)s;
             if (score[c] > mx) mx = score[c];
         }
 
-        float p[UNION_CAP], sum = 0;
-        for (int c = 0; c < n_cand; c++) { p[c] = expf((score[c]-mx)/temp); sum += p[c]; }
+        /* top-k restricted sampling: keep only the K highest-scoring candidates */
+        #define TOPK 5
+        int idx[UNION_CAP]; for (int c=0;c<n_cand;c++) idx[c]=c;
+        for (int a=0;a<n_cand && a<TOPK+1;a++)
+            for (int b=a+1;b<n_cand;b++)
+                if (score[idx[b]] > score[idx[a]]) { int t=idx[a];idx[a]=idx[b];idx[b]=t; }
+        int kk = n_cand < TOPK ? n_cand : TOPK;
+        float p[TOPK], sum = 0;
+        for (int c = 0; c < kk; c++) { p[c] = expf((score[idx[c]]-mx)/temp); sum += p[c]; }
         float r = (float)(fast_rand() % 100000) / 100000.0f * sum;
-        float cum = 0; uint32_t next = cand[0];
-        for (int c = 0; c < n_cand; c++) { cum += p[c]; if (r <= cum) { next = cand[c]; break; } }
+        float cum = 0; uint32_t next = cand[idx[0]];
+        for (int c = 0; c < kk; c++) { cum += p[c]; if (r <= cum) { next = cand[idx[c]]; break; } }
 
         tokens[n_tok++] = (int32_t)next;
 

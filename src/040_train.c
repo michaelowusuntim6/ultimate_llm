@@ -54,15 +54,15 @@ int main(int argc, char **argv) {
     float *uni = calloc((size_t)tok.n_vocab, sizeof(float));
     double uni_total = 0.0;
 
-    printf("[train] Initializing 4 sketches (8M slots each)...\n");
-    sketch_t sk[4];
+    printf("[train] Initializing 3 sketches (8M slots each)...\n");
+    sketch_t sk[3];
     char path[256];
-    for (int v = 0; v < 4; v++) {
+    for (int v = 0; v < 3; v++) {
         snprintf(path, sizeof(path), "%s/view_%d.db", model_dir, v);
         if (sk_init(&sk[v], path, 8388608) != 0) return 1;
     }
 
-    uint32_t seeds[4] = {0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35, 0x27D4EB2F};
+    uint32_t seeds[3] = {0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35};
 
     printf("[train] Opening corpus stream...\n");
     shard_reader_t sr;
@@ -80,22 +80,20 @@ int main(int argc, char **argv) {
         int32_t n_tok = tok_encode(&tok, line, (int32_t)len, tokens, 4096);
         if (n_tok < 6) { lines_read++; continue; }
 
-        for (int32_t i = 5; i < n_tok; i++) {
+        for (int32_t i = 3; i < n_tok; i++) {
             uint32_t t1 = (uint32_t)tokens[i-1], t2 = (uint32_t)tokens[i-2];
-            uint32_t t3 = (uint32_t)tokens[i-3], t4 = (uint32_t)tokens[i-4];
-            uint32_t t5 = (uint32_t)tokens[i-5];
+            uint32_t t3 = (uint32_t)tokens[i-3];
             uint32_t true_c = (uint32_t)tokens[i];
 
             /* unigram continuation tally */
             if (true_c < (uint32_t)tok.n_vocab) { uni[true_c] += 1.0f; uni_total += 1.0; }
 
-            uint32_t sig[4];
-            sig[0] = hash_sig(t1, t2, seeds[0]);
-            sig[1] = hash_sig(t2, t3, seeds[1]);
-            sig[2] = hash_sig(t1, t4, seeds[2]);
-            sig[3] = hash_sig(t3, t5, seeds[3]);
+            uint32_t sig[3];
+            sig[0] = hash_sig(t1, 0, seeds[0]);        /* bigram   */
+            sig[1] = hash_sig(t1, t2, seeds[1]);       /* trigram  */
+            sig[2] = hash_sig(hash_sig(t1, t2, seeds[1]), t3, seeds[2]); /* 4-gram */
 
-            for (int v = 0; v < 4; v++) {
+            for (int v = 0; v < 3; v++) {
                 sketch_slot_t *meta = sk_upsert(&sk[v], sig[v]);
                 /* find true_c in topk list */
                 int found = -1;
@@ -121,11 +119,11 @@ int main(int argc, char **argv) {
         if (lines_read % 10000 == 0) {
             double elapsed = now() - t_start;
             double tps = (double)total_tokens / elapsed;
-            printf("line %d | tokens %zu | %.0f tok/s | entries: %zu %zu %zu %zu\n",
+            printf("line %d | tokens %zu | %.0f tok/s | entries: %zu %zu %zu\n",
                    lines_read, total_tokens, tps,
-                   sk[0].n_entries, sk[1].n_entries, sk[2].n_entries, sk[3].n_entries);
+                   sk[0].n_entries, sk[1].n_entries, sk[2].n_entries);
             fflush(stdout);
-            for (int v = 0; v < 4; v++)
+            for (int v = 0; v < 3; v++)
                 if (sk[v].n_entries > sk[v].capacity * 0.85)
                     sk_evict_sweep(&sk[v], 2, 1);
         }
@@ -135,55 +133,51 @@ int main(int argc, char **argv) {
 
     /* ---- Held-out interpolation weight tuning (EM-style coordinate search) ---- */
     printf("[train] Tuning KN interpolation weights on held-out 10%%...\n");
-    float lam[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+    float lam[3] = {0.33f, 0.33f, 0.33f};
     double uni_norm = uni_total > 0 ? uni_total : 1.0;
 
-    /* score function: mean log-prob over held-out tokens given weights */
     #define EVAL_N 20000
     shard_reader_t tr;
     if (shard_open(&tr, "/home/mike/Vocab/dataset_prose.txt", 64) != 0) return 1;
     char *tl; size_t tlen; int tline = 0;
     int32_t ttokbuf[4096];
-    /* precompute per-token order probs for held-out sample */
-    static float hp[EVAL_N][5]; static uint32_t htrue[EVAL_N]; int hn = 0;
+    static float hp[EVAL_N][4]; static uint32_t htrue[EVAL_N]; int hn = 0;
     while (shard_next_line(&tr, &tl, &tlen) > 0 && hn < EVAL_N) {
         tline++;
-        if (tline % 10 != 0) continue; /* every 10th line ~ held-out */
+        if (tline % 10 != 0) continue;
         int nt = tok_encode(&tok, tl, (int32_t)tlen, ttokbuf, 4096);
-        for (int i = 5; i < nt && hn < EVAL_N; i++) {
-            uint32_t t1=(uint32_t)ttokbuf[i-1],t2=(uint32_t)ttokbuf[i-2];
-            uint32_t t3=(uint32_t)ttokbuf[i-3],t4=(uint32_t)ttokbuf[i-4],t5=(uint32_t)ttokbuf[i-5];
+        for (int i = 3; i < nt && hn < EVAL_N; i++) {
+            uint32_t t1=(uint32_t)ttokbuf[i-1],t2=(uint32_t)ttokbuf[i-2],t3=(uint32_t)ttokbuf[i-3];
             uint32_t tc=(uint32_t)ttokbuf[i];
-            uint32_t sg[4]={hash_sig(t1,t2,seeds[0]),hash_sig(t2,t3,seeds[1]),hash_sig(t1,t4,seeds[2]),hash_sig(t3,t5,seeds[3])};
+            uint32_t sg[3]={hash_sig(t1,0,seeds[0]),hash_sig(t1,t2,seeds[1]),hash_sig(hash_sig(t1,t2,seeds[1]),t3,seeds[2])};
             float p_uni = uni[tc]/uni_norm; if(p_uni<=0) p_uni=1e-6f;
-            hp[hn][4]=p_uni;
-            for (int v=0;v<4;v++){ sketch_slot_t*m=sk_get(&sk[v],sg[v]); hp[hn][v]=kn_prob(m,tc,0); }
+            hp[hn][3]=p_uni;
+            for (int v=0;v<3;v++){ sketch_slot_t*m=sk_get(&sk[v],sg[v]); hp[hn][v]=kn_prob(m,tc,0); }
             htrue[hn]=tc; hn++;
         }
     }
     shard_close(&tr);
 
-    double total_ll = 0; for(int i=0;i<hn;i++){ double pr=0; for(int v=0;v<4;v++)pr+=lam[v]*hp[i][v]; pr+= (1-lam[0]-lam[1]-lam[2]-lam[3])*hp[i][4]; if(pr<1e-12)pr=1e-12; total_ll+=log(pr);} 
+    double total_ll = 0; for(int i=0;i<hn;i++){ double pr=(1-lam[0]-lam[1]-lam[2])*hp[i][3]; for(int v=0;v<3;v++)pr+=lam[v]*hp[i][v]; if(pr<1e-12)pr=1e-12; total_ll+=log(pr);}
     for (int sweep=0; sweep<3; sweep++) {
-        for (int v=0; v<4; v++) {
+        for (int v=0; v<3; v++) {
             float best=lam[v]; double bestll=total_ll;
             for (float cand=0.0f; cand<=1.0001f; cand+=0.05f) {
                 float old=lam[v]; lam[v]=cand;
-                double s=0; for(int i=0;i<hn;i++){ double pr=0; for(int q=0;q<4;q++)pr+=lam[q]*hp[i][q]; float rem=1-lam[0]-lam[1]-lam[2]-lam[3]; if(rem<0)rem=0; pr+=rem*hp[i][4]; if(pr<1e-12)pr=1e-12; s+=log(pr);}
+                double s=0; for(int i=0;i<hn;i++){ double rem=1-lam[0]-lam[1]-lam[2]; if(rem<0)rem=0; double pr=rem*hp[i][3]; for(int q=0;q<3;q++)pr+=lam[q]*hp[i][q]; if(pr<1e-12)pr=1e-12; s+=log(pr);}
                 if (s>bestll){bestll=s;best=cand;}
                 lam[v]=old;
             }
             lam[v]=best; total_ll=bestll;
         }
-        /* renormalize so sum<=1 */
-        float sm=lam[0]+lam[1]+lam[2]+lam[3]; if(sm>1){for(int v=0;v<4;v++)lam[v]/=sm;}
+        float sm=lam[0]+lam[1]+lam[2]; if(sm>1){for(int v=0;v<3;v++)lam[v]/=sm;}
     }
-    FILE *wf=fopen("models/kneser_ney_weights.bin","wb"); if(wf){fwrite(lam,sizeof(float),4,wf);fclose(wf);}
-    printf("[train] learned lambda: %.3f %.3f %.3f %.3f (heldout LL/token=%.4f)\n",
-           lam[0],lam[1],lam[2],lam[3], hn?total_ll/hn:0);
+    FILE *wf=fopen("models/kneser_ney_weights.bin","wb"); if(wf){fwrite(lam,sizeof(float),3,wf);fclose(wf);}
+    printf("[train] learned lambda: %.3f %.3f %.3f (heldout LL/token=%.4f)\n",
+           lam[0],lam[1],lam[2], hn?total_ll/hn:0);
 
     free(uni);
-    for (int v = 0; v < 4; v++) sk_free(&sk[v]);
+    for (int v = 0; v < 3; v++) sk_free(&sk[v]);
     shard_close(&sr);
     tok_free(&tok);
     return 0;

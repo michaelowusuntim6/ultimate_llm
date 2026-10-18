@@ -10,11 +10,12 @@
  * ───────────────────────────────────────────────────────────────────────────── */
 typedef struct {
     uint32_t key;       /* FNV-1a signature (0 = empty) */
-    uint32_t class_id;  /* The most confident next-token for this signature */
-    float    logit;     /* W[sig][class] score */
-    uint16_t count;     /* occurrence count (capped) */
-    uint16_t gen;       /* generation stamp for eviction */
-    uint32_t topk_classes[8]; /* Top-8 predicted next-tokens for this signature */
+    uint32_t class_id;  /* Top-1 next-token for this signature */
+    float    logit;     /* Unused in count model (kept for layout stability) */
+    uint16_t count;     /* Total occurrences of this context */
+    uint16_t gen;       /* Generation stamp (unused) */
+    uint32_t topk_classes[8];
+    uint16_t topk_counts[8]; /* Counts for each Top-K class */
 } sketch_slot_t;
 
 typedef struct {

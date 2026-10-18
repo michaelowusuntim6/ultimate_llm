@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
 
 #define UNION_CAP 96
 
@@ -14,16 +13,16 @@ static inline uint32_t hash_sig(uint32_t t1, uint32_t t2, uint32_t seed) {
     return h ? h : 1;
 }
 
-/* Simple xorshift random number generator for sampling */
 static uint32_t rng_state = 12345;
-static inline uint32_t fast_rand() {
+static inline uint32_t fast_rand(void) {
     rng_state ^= rng_state << 13; rng_state ^= rng_state >> 17; rng_state ^= rng_state << 5;
     return rng_state;
 }
 
 int main(int argc, char **argv) {
     tokenizer_t tok;
-    if (tok_init(&tok, "/home/mike/Vocab/vocab_english.txt", "/home/mike/Vocab/byte_fallback_tokens.txt") != 0) return 1;
+    if (tok_init(&tok, "/home/mike/Vocab/tokenizer_pure/vocab.json",
+                      "/home/mike/Vocab/tokenizer_pure/merges.txt") != 0) return 1;
 
     sketch_t sk[4];
     char path[256];
@@ -32,131 +31,65 @@ int main(int argc, char **argv) {
         if (sk_init(&sk[v], path, 8388608) != 0) return 1;
     }
 
-    /* Load unigrams for negative sampling during generation (same as trainer) */
-    uint32_t unigrams[1000];
-    FILE *uf = fopen("models/top_unigrams.bin", "rb");
-    if (uf) {
-        if (fread(unigrams, sizeof(uint32_t), 1000, uf) != 1000)
-            fprintf(stderr, "[infer] top_unigrams.bin short read\n");
-        fclose(uf);
-    } else {
-        /* Fallback if missing */
-        for(int i=0; i<1000; i++) unigrams[i] = (uint32_t)(rand() % tok.n_vocab);
-    }
-
     uint32_t seeds[4] = {0x9E3779B1, 0x85EBCA6B, 0xC2B2AE35, 0x27D4EB2F};
-    float lambda[4] = {0.25f, 0.25f, 0.25f, 0.25f};
-    FILE *lf = fopen("models/lambdas.bin", "rb");
-    if (lf) {
-        if (fread(lambda, sizeof(float), 4, lf) != 4)
-            fprintf(stderr, "[infer] lambdas.bin short read; using defaults\n");
-        fclose(lf);
-    } else {
-        fprintf(stderr, "[infer] no lambdas.bin; using defaults\n");
-    }
+    /* Stupid-backoff weights per view: higher-order views get more trust. */
+    float backoff_w[4] = {0.4f, 0.25f, 0.2f, 0.15f};
     float temp = 1.0f;
 
-    /* Setup default prompt or grab from args */
     const char *prompt = (argc > 1) ? argv[1] : "The";
     int max_gen = (argc > 2) ? atoi(argv[2]) : 50;
 
-    /* TEMP HACK: lowercase the prompt so proper nouns match the lowercase vocab. */
-    char lower_prompt[512];
-    strncpy(lower_prompt, prompt, 511);
-    lower_prompt[511] = '\0';
-    for (int i = 0; lower_prompt[i]; i++) {
-        if (lower_prompt[i] >= 'A' && lower_prompt[i] <= 'Z') lower_prompt[i] += 32;
-    }
-
-    int32_t tokens[2048];
-    int n_tok = tok_encode(&tok, lower_prompt, (int32_t)strlen(lower_prompt), tokens, 2048);
+    int32_t tokens[4096];
+    int n_tok = tok_encode(&tok, prompt, (int32_t)strlen(prompt), tokens, 4096);
     if (n_tok < 1) { printf("Empty prompt.\n"); return 1; }
 
-    printf("Prompt: %s\n", prompt);
-    printf("Generating %d tokens...\n", max_gen);
+    printf("Prompt: %s\nGenerating %d tokens...\n", prompt, max_gen);
 
-    char out_buf[8192];
+    char out_buf[16384];
     int out_len = 0;
+    /* echo the prompt first */
+    { int dl = tok_decode(&tok, tokens, n_tok, out_buf, sizeof(out_buf)-1); if (dl>0) out_len = dl; }
 
     for (int step = 0; step < max_gen; step++) {
         int32_t i = n_tok;
-        if (i < 5) break; /* Need at least 5 tokens for expanded context */
+        if (i < 5) break;
 
-        uint32_t t1 = (uint32_t)tokens[i-1];
-        uint32_t t2 = (uint32_t)tokens[i-2];
-        uint32_t t3 = (uint32_t)tokens[i-3];
-        uint32_t t4 = (uint32_t)tokens[i-4];
-        uint32_t t5 = (uint32_t)tokens[i-5];
-        uint32_t pos_bucket = (uint32_t)(i % 8);
-
+        uint32_t t1=(uint32_t)tokens[i-1], t2=(uint32_t)tokens[i-2];
+        uint32_t t3=(uint32_t)tokens[i-3], t4=(uint32_t)tokens[i-4], t5=(uint32_t)tokens[i-5];
         uint32_t sig[4];
-        sig[0] = hash_sig(t1, t2, seeds[0]); sig[1] = hash_sig(t2, t3, seeds[1]);
-        sig[2] = hash_sig(t1, t4, seeds[2]); sig[3] = hash_sig(t3, t5, seeds[3]);
+        sig[0]=hash_sig(t1,t2,seeds[0]); sig[1]=hash_sig(t2,t3,seeds[1]);
+        sig[2]=hash_sig(t1,t4,seeds[2]); sig[3]=hash_sig(t3,t5,seeds[3]);
 
+        /* gather candidates from all Top-K lists across views */
         uint32_t cand[UNION_CAP]; int n_cand = 0;
-
-        /* 1. Gather Top-8 from each context view */
+        float score[UNION_CAP];
         for (int v = 0; v < 4; v++) {
             sketch_slot_t *meta = sk_get(&sk[v], sig[v]);
-            if (meta && meta->count > 0) {
-                for (int j = 0; j < 8; j++) {
-                    uint32_t cl = meta->topk_classes[j];
-                    if (cl == 0) continue; /* empty slot */
-                    int found = 0;
-                    for (int q = 0; q < n_cand; q++) if (cand[q] == cl) { found = 1; break; }
-                    if (!found) cand[n_cand++] = cl;
-                }
+            if (!meta || meta->count == 0) continue;
+            for (int k = 0; k < 8; k++) {
+                uint32_t cl = meta->topk_classes[k];
+                if (cl == 0 || meta->topk_counts[k] == 0) continue;
+                int found = -1;
+                for (int j = 0; j < n_cand; j++) if (cand[j] == cl) { found = j; break; }
+                float p = (float)meta->topk_counts[k] / (float)meta->count;
+                if (found >= 0) score[found] += p * backoff_w[v];
+                else if (n_cand < UNION_CAP) { cand[n_cand] = cl; score[n_cand] = p * backoff_w[v]; n_cand++; }
             }
         }
+        if (n_cand == 0) break; /* no continuation known */
 
-        /* 2. Pad with unigrams (deduplicated) */
-        while (n_cand < UNION_CAP) {
-            uint32_t u = unigrams[fast_rand() % 1000];
-            int found = 0; for(int j=0; j<n_cand; j++) if(cand[j] == u) { found=1; break; }
-            if (!found) cand[n_cand++] = u;
-        }
+        /* softmax over scores with temperature, then sample */
+        float mx = -1e30f;
+        for (int c = 0; c < n_cand; c++) if (score[c]/temp > mx) mx = score[c]/temp;
+        float sum = 0; float p[UNION_CAP];
+        for (int c = 0; c < n_cand; c++) { p[c] = expf(score[c]/temp - mx); sum += p[c]; }
+        float r = (float)(fast_rand() % 100000) / 100000.0f * sum;
+        float cum = 0; uint32_t next = cand[0];
+        for (int c = 0; c < n_cand; c++) { cum += p[c]; if (r <= cum) { next = cand[c]; break; } }
 
-        /* 3. Score */
-        float score[UNION_CAP], max_score = -1e9f;
-        for (int c = 0; c < n_cand; c++) {
-            score[c] = 0.0f;
-            for (int v = 0; v < 4; v++) {
-                uint32_t k = fnv1a_u32_combine(sig[v], cand[c]);
-                sketch_slot_t *w = sk_get(&sk[v], k);
-                if (w) score[c] += lambda[v] * w->logit;
-            }
-            score[c] /= temp; /* Apply temperature */
-            if (score[c] > max_score) max_score = score[c];
-        }
-
-        /* 4. Softmax */
-        float p[UNION_CAP], sum_exp = 0.0f;
-        for (int c = 0; c < n_cand; c++) { p[c] = expf(score[c] - max_score); sum_exp += p[c]; }
-        float inv_sum = 1.0f / sum_exp;
-
-        /* 5. Sample */
-        float r = (float)(fast_rand() % 100000) / 100000.0f;
-        float cum = 0.0f;
-        uint32_t next_tok = cand[0];
-        for (int c = 0; c < n_cand; c++) {
-            p[c] *= inv_sum;
-            cum += p[c];
-            if (r <= cum) { next_tok = cand[c]; break; }
-        }
-
-        /* 6. Append and decode */
-        tokens[n_tok++] = (int32_t)next_tok;
-
-        /* Inject space before word tokens, but avoid double spaces */
-        if (next_tok < (uint32_t)tok.n_word_tokens && out_len > 0) {
-            if (out_buf[out_len-1] != ' ') {
-                out_buf[out_len++] = ' ';
-            }
-        }
-
-        int32_t nt32 = (int32_t)next_tok;
-        int32_t decoded = tok_decode(&tok, &nt32, 1, out_buf + out_len, 8192 - out_len);
-        if (decoded > 0) out_len += decoded;
+        tokens[n_tok++] = (int32_t)next;
+        int dl = tok_decode(&tok, (const int32_t[]){(int32_t)next}, 1, out_buf + out_len, (int32_t)sizeof(out_buf) - out_len - 1);
+        if (dl > 0) out_len += dl;
     }
 
     out_buf[out_len] = '\0';

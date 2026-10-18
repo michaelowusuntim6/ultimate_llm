@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     int bench_tokens = (argc > 1) ? atoi(argv[1]) : 100;
 
     tokenizer_t tok;
-    if (tok_init(&tok, "/home/mike/Vocab/vocab_english.txt", "/home/mike/Vocab/byte_fallback_tokens.txt") != 0) return 1;
+    if (tok_init(&tok, "/home/mike/Vocab/tokenizer_pure/vocab.json", "/home/mike/Vocab/tokenizer_pure/merges.txt") != 0) return 1;
 
     sketch_t sk[4];
     char path[256];

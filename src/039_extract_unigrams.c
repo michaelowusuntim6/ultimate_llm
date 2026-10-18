@@ -18,8 +18,8 @@ static int cmp_count_desc(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-    const char *vocab   = "/home/mike/Vocab/tokenizer_pure/vocab.json";
-    const char *fallback= "/home/mike/Vocab/tokenizer_pure/merges.txt";
+    const char *vocab   = "/home/mike/Vocab/vocab_english.txt";
+    const char *fallback= "/home/mike/Vocab/byte_fallback_tokens.txt";
     const char *corpus  = (argc > 1) ? argv[1] : "/home/mike/Vocab/dataset_prose.txt";
     const char *outpath = (argc > 2) ? argv[2] : "models/top_unigrams.bin";
     int         K       = (argc > 3) ? atoi(argv[3]) : 1000;

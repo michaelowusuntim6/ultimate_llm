@@ -54,8 +54,8 @@ static double kn_rec(const sketch_slot_t *m[3], const float lam[3],
 
 int main(int argc, char **argv) {
     tokenizer_t tok;
-    if (tok_init(&tok, "/home/mike/Vocab/tokenizer_pure/vocab.json",
-                      "/home/mike/Vocab/tokenizer_pure/merges.txt") != 0) return 1;
+    if (tok_init(&tok, "/home/mike/Vocab/vocab_english.txt",
+                      "/home/mike/Vocab/byte_fallback_tokens.txt") != 0) return 1;
 
     sketch_t sk[3];
     char path[256];
@@ -93,11 +93,14 @@ int main(int argc, char **argv) {
     int out_len = 0;
     { int dl = tok_decode(&tok, tokens, n_tok, out_buf, sizeof(out_buf)-1); if (dl>0) out_len = dl; }
 
-    for (int step = 0; step < max_gen; step++) {
-        int32_t i = n_tok;
-        if (i < 3) break;
+    /* word-only context for signature formation (bridge over spaces/punct bytes) */
+    static int32_t wctx[4096]; int nw = 0;
+    for (int j = 0; j < n_tok; j++) if (tokens[j]>=0 && tokens[j]<tok.n_word_tokens) wctx[nw++]=tokens[j];
 
-        uint32_t t1=(uint32_t)tokens[i-1], t2=(uint32_t)tokens[i-2], t3=(uint32_t)tokens[i-3];
+    for (int step = 0; step < max_gen; step++) {
+        if (nw < 3) break;
+
+        uint32_t t1=(uint32_t)wctx[nw-1], t2=(uint32_t)wctx[nw-2], t3=(uint32_t)wctx[nw-3];
         uint32_t sig[3];
         sig[0]=hash_sig(t1,0,seeds[0]);
         sig[1]=hash_sig(t1,t2,seeds[1]);
@@ -106,19 +109,21 @@ int main(int argc, char **argv) {
         const sketch_slot_t *m[3];
         for (int v = 0; v < 3; v++) m[v] = sk_get(&sk[v], sig[v]);
 
-        /* candidate set: seed with unigrams, skipping specials/unk */
+        /* candidate set: seed with unigrams (word tokens only) */
         uint32_t cand[UNION_CAP]; int n_cand = 0;
+        uint32_t special_base = (uint32_t)tok.n_vocab - 5;
         for (int j = 0; j < n_top && n_cand < UNION_CAP; j++) {
-            uint32_t cl = top_u[j]; if (cl < 5) continue; /* skip <pad><unk><bos><eos><mask> */
+            uint32_t cl = top_u[j];
+            if (cl >= (uint32_t)tok.n_word_tokens || cl >= special_base) continue; /* words only */
             int found=0; for(int q=0;q<n_cand;q++)if(cand[q]==cl){found=1;break;}
             if(!found) cand[n_cand++]=cl;
         }
-        /* then add sketch Top-K candidates (skip specials) */
+        /* then add sketch Top-K candidates (word tokens only) */
         for (int v = 0; v < 3; v++) {
             if (!m[v] || m[v]->count == 0) continue;
             for (int k = 0; k < 8 && n_cand < UNION_CAP; k++) {
                 uint32_t cl = m[v]->topk_classes[k];
-                if (cl < 5 || m[v]->topk_counts[k] == 0) continue;
+                if (cl >= (uint32_t)tok.n_word_tokens || m[v]->topk_counts[k] == 0) continue;
                 int found=0; for(int q=0;q<n_cand;q++)if(cand[q]==cl){found=1;break;}
                 if(!found) cand[n_cand++]=cl;
             }
@@ -132,10 +137,6 @@ int main(int argc, char **argv) {
             double p_uni = 1e-9;
             for (int j = 0; j < n_top; j++) if (top_u[j]==w) { p_uni = (double)uni_p[j]/utot; break; }
             double s = kn_rec(m, lam, w, 2, p_uni);
-            /* prefer real words over single-letter subword fragments */
-            int32_t wid = (int32_t)w;
-            int is_word = (wid >= 0 && wid < tok.n_vocab && tok.text_len[wid] > 2);
-            if (!is_word) s *= 0.5;   /* damp short/fragment pieces to reduce salad */
             score[c] = (float)s;
             if (score[c] > mx) mx = score[c];
         }
@@ -154,17 +155,17 @@ int main(int argc, char **argv) {
         for (int c = 0; c < kk; c++) { cum += p[c]; if (r <= cum) { next = cand[idx[c]]; break; } }
 
         tokens[n_tok++] = (int32_t)next;
+        if ((uint32_t)next < (uint32_t)tok.n_word_tokens && nw < 4096) wctx[nw++] = (int32_t)next;
 
-        /* deterministic spacing post-processing */
+        /* word-token space injection: insert a space before a dictionary word if
+           the previous printed char isn't already whitespace. */
         int32_t nt = (int32_t)next;
         char piece[64]; int pl = tok_decode(&tok, &nt, 1, piece, sizeof(piece)-1);
         if (pl > 0) {
             piece[pl]='\0';
-            int starts_space = (piece[0]==' '||piece[0]=='\t');
-            int starts_punct = (piece[0]=='.'||piece[0]==','||piece[0]=='!'||piece[0]=='?'||piece[0]==';'||piece[0]==':');
+            int is_word = ((uint32_t)nt < (uint32_t)tok.n_word_tokens);
             int prev_space = (out_len>0 && (out_buf[out_len-1]==' '||out_buf[out_len-1]=='\t'||out_buf[out_len-1]=='\n'));
-            int prev_punct = (out_len>0 && (out_buf[out_len-1]=='.'||out_buf[out_len-1]==','||out_buf[out_len-1]=='!'||out_buf[out_len-1]=='?'));
-            if (!starts_space && !starts_punct && out_len>0 && !prev_space && !prev_punct)
+            if (is_word && out_len>0 && !prev_space)
                 if (out_len+1<(int)sizeof(out_buf)) out_buf[out_len++]=' ';
             if (out_len + pl < (int)sizeof(out_buf)) { memcpy(out_buf+out_len, piece, pl); out_len += pl; }
         }

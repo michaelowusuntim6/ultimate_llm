@@ -53,10 +53,10 @@ int main(int argc, char **argv) {
     const char *model_dir = (argc > 1) ? argv[1] : "models";
     int max_lines = (argc > 2) ? atoi(argv[2]) : 175926;
 
-    printf("[train] Loading BPE tokenizer...\n");
+    printf("[train] Loading 231k word tokenizer...\n");
     tokenizer_t tok;
-    if (tok_init(&tok, "/home/mike/Vocab/tokenizer_pure/vocab.json",
-                      "/home/mike/Vocab/tokenizer_pure/merges.txt") != 0) return 1;
+    if (tok_init(&tok, "/home/mike/Vocab/vocab_english.txt",
+                      "/home/mike/Vocab/byte_fallback_tokens.txt") != 0) return 1;
 
     /* Unigram continuation counts (for KN base distribution). */
     float *uni = calloc((size_t)tok.n_vocab, sizeof(float));
@@ -86,12 +86,16 @@ int main(int argc, char **argv) {
 
     while (shard_next_line(&sr, &line, &len) > 0 && lines_read < max_lines) {
         int32_t n_tok = tok_encode(&tok, line, (int32_t)len, tokens, 4096);
-        if (n_tok < 6) { lines_read++; continue; }
+        /* keep only dictionary word tokens; bridge over spaces/punct bytes */
+        static int32_t words[4096]; int nw = 0;
+        for (int j = 0; j < n_tok; j++)
+            if (tokens[j] >= 0 && tokens[j] < tok.n_word_tokens) words[nw++] = tokens[j];
+        if (nw < 4) { lines_read++; continue; }
 
-        for (int32_t i = 3; i < n_tok; i++) {
-            uint32_t t1 = (uint32_t)tokens[i-1], t2 = (uint32_t)tokens[i-2];
-            uint32_t t3 = (uint32_t)tokens[i-3];
-            uint32_t true_c = (uint32_t)tokens[i];
+        for (int i = 3; i < nw; i++) {
+            uint32_t t1 = (uint32_t)words[i-1], t2 = (uint32_t)words[i-2];
+            uint32_t t3 = (uint32_t)words[i-3];
+            uint32_t true_c = (uint32_t)words[i];
 
             /* unigram continuation tally */
             if (true_c < (uint32_t)tok.n_vocab) { uni[true_c] += 1.0f; uni_total += 1.0; }
@@ -156,9 +160,11 @@ int main(int argc, char **argv) {
         tline++;
         if (tline % 10 != 0) continue;
         int nt = tok_encode(&tok, tl, (int32_t)tlen, ttokbuf, 4096);
-        for (int i = 3; i < nt && hn < EVAL_N; i++) {
-            uint32_t t1=(uint32_t)ttokbuf[i-1],t2=(uint32_t)ttokbuf[i-2],t3=(uint32_t)ttokbuf[i-3];
-            uint32_t tc=(uint32_t)ttokbuf[i];
+        static int32_t tw[4096]; int tnw = 0;
+        for (int j = 0; j < nt; j++) if (ttokbuf[j]>=0 && ttokbuf[j]<tok.n_word_tokens) tw[tnw++]=ttokbuf[j];
+        for (int i = 3; i < tnw && hn < EVAL_N; i++) {
+            uint32_t t1=(uint32_t)tw[i-1],t2=(uint32_t)tw[i-2],t3=(uint32_t)tw[i-3];
+            uint32_t tc=(uint32_t)tw[i];
             uint32_t sg[3]={hash_sig(t1,0,seeds[0]),hash_sig(t1,t2,seeds[1]),hash_sig(hash_sig(t1,t2,seeds[1]),t3,seeds[2])};
             float p_uni = uni[tc]/uni_norm; if(p_uni<=0) p_uni=1e-6f;
             hp[hn][3]=p_uni;

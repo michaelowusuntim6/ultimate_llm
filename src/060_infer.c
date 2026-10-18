@@ -98,9 +98,9 @@ int main(int argc, char **argv) {
     for (int j = 0; j < n_tok; j++) if (tokens[j]>=0 && tokens[j]<tok.n_word_tokens) wctx[nw++]=tokens[j];
 
     for (int step = 0; step < max_gen; step++) {
-        if (nw < 3) break;
-
-        uint32_t t1=(uint32_t)wctx[nw-1], t2=(uint32_t)wctx[nw-2], t3=(uint32_t)wctx[nw-3];
+        uint32_t t1 = nw>=1 ? (uint32_t)wctx[nw-1] : 0;
+        uint32_t t2 = nw>=2 ? (uint32_t)wctx[nw-2] : 0;
+        uint32_t t3 = nw>=3 ? (uint32_t)wctx[nw-3] : 0;
         uint32_t sig[3];
         sig[0]=hash_sig(t1,0,seeds[0]);
         sig[1]=hash_sig(t1,t2,seeds[1]);

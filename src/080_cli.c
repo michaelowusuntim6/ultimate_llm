@@ -57,11 +57,16 @@ static void generate(tokenizer_t *tok, sketch_t sk[3], const float lam[3],
     static int32_t wctx[4096]; int nw = 0;
     for (int j = 0; j < n_tok; j++) if (tokens[j]>=0 && tokens[j]<tok->n_word_tokens) wctx[nw++]=tokens[j];
     for (int step = 0; step < GEN_TOKENS; step++) {
-        if (nw < 3) break;
-        uint32_t t1=(uint32_t)wctx[nw-1], t2=(uint32_t)wctx[nw-2], t3=(uint32_t)wctx[nw-3];
+        /* Pad short contexts with BOS(0) so signature hashing stays in-bounds
+           and the recursion still falls back to lower orders / unigrams. */
+        uint32_t t1 = nw>=1 ? (uint32_t)wctx[nw-1] : 0;
+        uint32_t t2 = nw>=2 ? (uint32_t)wctx[nw-2] : 0;
+        uint32_t t3 = nw>=3 ? (uint32_t)wctx[nw-3] : 0;
         uint32_t sig[3]={hash_sig(t1,0,seeds[0]),hash_sig(t1,t2,seeds[1]),hash_sig(hash_sig(t1,t2,seeds[1]),t3,seeds[2])};
         const sketch_slot_t *m[3]; for(int v=0;v<3;v++) m[v]=sk_get(&sk[v],sig[v]);
 
+        /* Candidate set: ALWAYS seed with top unigrams (word tokens only), so a
+           short/empty context still has something to score. */
         uint32_t cand[UNION_CAP]; int n_cand=0;
         for(int j=0;j<n_top&&n_cand<UNION_CAP;j++){uint32_t cl=top_u[j];if(cl>=(uint32_t)tok->n_word_tokens||cl>=special_base)continue;int f=0;for(int q=0;q<n_cand;q++)if(cand[q]==cl)f=1;if(!f)cand[n_cand++]=cl;}
         for(int v=0;v<3;v++){if(!m[v]||m[v]->count==0)continue;for(int k=0;k<8&&n_cand<UNION_CAP;k++){uint32_t cl=m[v]->topk_classes[k];if(cl>=(uint32_t)tok->n_word_tokens||m[v]->topk_counts[k]==0)continue;int f=0;for(int q=0;q<n_cand;q++)if(cand[q]==cl)f=1;if(!f)cand[n_cand++]=cl;}}
@@ -74,11 +79,23 @@ static void generate(tokenizer_t *tok, sketch_t sk[3], const float lam[3],
         for(int a=0;a<n_cand&&a<TOPK+1;a++)for(int b=a+1;b<n_cand;b++)if(score[idx[b]]>score[idx[a]]){int t=idx[a];idx[a]=idx[b];idx[b]=t;}
         int kk=n_cand<TOPK?n_cand:TOPK;
         float p[TOPK],sum=0; for(int c=0;c<kk;c++){p[c]=expf((score[idx[c]]-mx)/0.5f);sum+=p[c];}
-        float r=(float)(fast_rand()%100000)/100000.0f*sum; float cum=0; uint32_t next=cand[idx[0]];
-        for(int c=0;c<kk;c++){cum+=p[c];if(r<=cum){next=cand[idx[c]];break;}}
 
-        int32_t nt=(int32_t)next; char word[64]; int wl=tok_decode(tok,&nt,1,word,sizeof(word)-1);
-        if(wl<=0) break; word[wl]='\0';
+        /* Sample, resampling until the token decodes to a non-empty string. */
+        uint32_t next = cand[idx[0]]; char word[64]; int wl = 0;
+        for (int attempt=0; attempt<kk*3; attempt++) {
+            float r=(float)(fast_rand()%100000)/100000.0f*sum; float cum=0; uint32_t pick=cand[idx[0]];
+            for(int c=0;c<kk;c++){cum+=p[c];if(r<=cum){pick=cand[idx[c]];break;}}
+            int32_t pid=(int32_t)pick;
+            int l=tok_decode(tok,&pid,1,word,sizeof(word)-1);
+            if(l>0 && !(l==1 && (word[0]==' '||word[0]=='\t'))){ wl=l; next=pick; break; }
+        }
+        if(wl<=0){ /* last-resort: take highest-scoring candidate that decodes */
+            int32_t pid=(int32_t)cand[idx[0]]; wl=tok_decode(tok,&pid,1,word,sizeof(word)-1); next=cand[idx[0]];
+            if(wl<=0) break;
+        }
+        word[wl]='\0';
+
+        int32_t nt=(int32_t)next;
         int is_word=((uint32_t)nt<(uint32_t)tok->n_word_tokens);
         if(is_word && step>0) printf(" ");
         printf("\033[0m%s", word); fflush(stdout);
